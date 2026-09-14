@@ -337,19 +337,176 @@ nouveau_bo_fence_wait(struct nouveau_bo *bo, uint32_t access)
 	return ret;
 }
 
+/* Wine-NX: a bo costs a heap allocation, two nvservices ioctls and a GPU
+ * address space mapping, and Mesa creates and destroys them per transfer. Keep
+ * freed ones for reuse, capped so the process heap stays available. */
+#define NOUVEAU_BO_CACHE_ENTRIES 16
+#define NOUVEAU_BO_CACHE_BYTES   (16u << 20)
+#define NOUVEAU_BO_CACHE_MAX_BO  (8u << 20)
+
+static Mutex nouveau_bo_cache_lock;
+static struct nouveau_bo_priv *nouveau_bo_cache[NOUVEAU_BO_CACHE_ENTRIES];
+static unsigned int nouveau_bo_cache_count;
+static uint64_t nouveau_bo_cache_bytes;
+
+/* Reported by Wine-NX's [PROGRESS]: bos created, bos taken from the cache, and
+ * the time spent creating them. */
+unsigned int wine_nx_nouveau_bo_new, wine_nx_nouveau_bo_reused;
+uint64_t wine_nx_nouveau_bo_new_ns;
+
+static void
+nouveau_bo_destroy(struct nouveau_bo_priv *nvbo)
+{
+	struct nouveau_device_priv *nvdev = nouveau_device(nvbo->base.device);
+
+	nouveau_bo_fence_wait(&nvbo->base, 0);
+	nvAddressSpaceUnmap(&nvdev->addr_space, nvbo->base.offset);
+	nvMapClose(&nvbo->map);
+	if (nvbo->map_addr && !nvbo->user_memory)
+		free(nvbo->map_addr);
+	free(nvbo);
+}
+
+/* A cached bo keeps its memory, its nvmap handle and its GPU address; only the
+ * fence of its last use is still pending, and its next user waits for that. */
+static struct nouveau_bo_priv *
+nouveau_bo_cache_take(struct nouveau_device *dev, uint32_t flags, uint32_t align,
+		      uint64_t size, NvKind kind)
+{
+	struct nouveau_bo_priv *nvbo = NULL;
+	unsigned int i;
+
+	mutexLock(&nouveau_bo_cache_lock);
+	for (i = 0; i < nouveau_bo_cache_count; i++) {
+		struct nouveau_bo_priv *entry = nouveau_bo_cache[i];
+
+		if (entry->base.device != dev || entry->base.size != size ||
+		    entry->base.flags != flags || entry->kind != kind || entry->align < align)
+			continue;
+		nvbo = entry;
+		nouveau_bo_cache[i] = nouveau_bo_cache[--nouveau_bo_cache_count];
+		nouveau_bo_cache_bytes -= size;
+		break;
+	}
+	mutexUnlock(&nouveau_bo_cache_lock);
+	return nvbo;
+}
+
+static bool
+nouveau_bo_cache_put(struct nouveau_bo_priv *nvbo)
+{
+	if (nvbo->user_memory || nvbo->base.size > NOUVEAU_BO_CACHE_MAX_BO)
+		return false;
+
+	mutexLock(&nouveau_bo_cache_lock);
+	if (nouveau_bo_cache_count == NOUVEAU_BO_CACHE_ENTRIES ||
+	    nouveau_bo_cache_bytes + nvbo->base.size > NOUVEAU_BO_CACHE_BYTES) {
+		mutexUnlock(&nouveau_bo_cache_lock);
+		return false;
+	}
+	nvbo->base.map = NULL;
+	nouveau_bo_cache[nouveau_bo_cache_count++] = nvbo;
+	nouveau_bo_cache_bytes += nvbo->base.size;
+	mutexUnlock(&nouveau_bo_cache_lock);
+	return true;
+}
+
 static void
 nouveau_bo_del(struct nouveau_bo *bo)
 {
 	CALLED();
 	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
-	struct nouveau_device_priv *nvdev = nouveau_device(bo->device);
 
-	nouveau_bo_fence_wait(bo, 0);
-	nvAddressSpaceUnmap(&nvdev->addr_space, bo->offset);
-	nvMapClose(&nvbo->map);
-	if (nvbo->map_addr)
-		free(nvbo->map_addr);
-	free(nvbo);
+	/* Its pending fence is waited for by whoever takes it out again. */
+	if (nouveau_bo_cache_put(nvbo))
+		return;
+	nouveau_bo_destroy(nvbo);
+}
+
+/* Wine-NX: the result of the last refused nouveau_bo_wrap_user, for its log. */
+unsigned int wine_nx_nouveau_wrap_result;
+
+/* Wine-NX: map pinned application memory CPU-cacheable. Uncached pages make the
+ * application's own drawing slow, since Horizon maps them Normal-NotCacheable
+ * and every read misses to DRAM. The runtime clears this when
+ * switch/wine/gl-uncached.txt exists, to compare. */
+int wine_nx_nouveau_pin_cached = 1;
+unsigned int wine_nx_nouveau_cache_cleans;
+uint64_t wine_nx_nouveau_cache_clean_ns;
+/* Wine-NX: set by the runtime when switch/wine/gl-noclean.txt exists, to see
+ * whether the GPU reads pinned buffers correctly without the clean below. */
+int wine_nx_nouveau_skip_clean;
+
+/* Writes the bo's cache lines back so the GPU reads what the CPU wrote. It
+ * walks the whole bo: NFSU2's pinned Direct3D buffers took ~2 ms per clean.
+ * Only the CPU-to-GPU direction: nothing invalidates after the GPU writes,
+ * which pinned buffers (upload sources) never need. */
+void
+nouveau_bo_cpu_clean(struct nouveau_bo *bo)
+{
+	struct nouveau_bo_priv *nvbo = nouveau_bo(bo);
+	uint64_t start;
+
+	if (!nvbo->cacheable || !nvbo->map_addr || wine_nx_nouveau_skip_clean)
+		return;
+
+	start = armTicksToNs(armGetSystemTick());
+	armDCacheClean(nvbo->map_addr, bo->size);
+	wine_nx_nouveau_cache_clean_ns += armTicksToNs(armGetSystemTick()) - start;
+	wine_nx_nouveau_cache_cleans++;
+}
+
+/* Wine-NX: a bo over page-aligned memory the caller owns (GL_AMD_pinned_memory).
+ * nvservices maps the pages for the GPU in place: nothing is copied, and the
+ * memory is left to the caller once the bo is gone. */
+int
+nouveau_bo_wrap_user(struct nouveau_device *dev, uint32_t flags, void *ptr,
+		     uint64_t size, struct nouveau_bo **pbo)
+{
+	CALLED();
+	struct nouveau_device_priv *nvdev = nouveau_device(dev);
+	struct nouveau_bo_priv *nvbo;
+	struct nouveau_bo *bo;
+	Result rc;
+
+	if (!ptr || ((uintptr_t)ptr & 0xFFF) || !size || (size & 0xFFF))
+		return -EINVAL;
+	if (!(nvbo = calloc(1, sizeof(*nvbo))))
+		return -ENOMEM;
+	bo = &nvbo->base;
+
+	nvbo->cacheable = wine_nx_nouveau_pin_cached != 0;
+	rc = nvMapCreate(&nvbo->map, ptr, size, 0x1000, NvKind_Pitch, nvbo->cacheable);
+	if (R_FAILED(rc))
+	{
+		TRACE("Failed to create nvmap object over %p (%x)\n", ptr, rc);
+		wine_nx_nouveau_wrap_result = rc;
+		free(nvbo);
+		return -EINVAL;
+	}
+
+	rc = nvAddressSpaceMap(&nvdev->addr_space, nvMapGetHandle(&nvbo->map), !(flags & NOUVEAU_BO_COHERENT), NvKind_Pitch, &bo->offset);
+	if (R_FAILED(rc))
+	{
+		TRACE("Failed to map user memory to address space (%x)\n", rc);
+		wine_nx_nouveau_wrap_result = rc;
+		nvMapClose(&nvbo->map);
+		free(nvbo);
+		return -EINVAL;
+	}
+
+	atomic_set(&nvbo->refcnt, 1);
+	bo->device = dev;
+	bo->handle = nvMapGetHandle(&nvbo->map);
+	bo->size = size;
+	bo->flags = flags;
+	nvbo->map_addr = ptr;
+	nvbo->user_memory = 1;
+	nvbo->kind = NvKind_Pitch;
+	nvbo->align = 0x1000;
+	nvbo->fence.id = UINT32_MAX;
+	*pbo = bo;
+	return 0;
 }
 
 int
@@ -364,6 +521,8 @@ nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align,
 	struct nouveau_bo *bo = &nvbo->base;
 	Result rc;
 
+	uint64_t start_ns;
+
 	if (align < 0x1000)
 		align = 0x1000;
 	size = (size + 0xFFF) &~ 0xFFF;
@@ -375,6 +534,26 @@ nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align,
 	if (config)
 		kind = (NvKind)config->nvc0.memtype;
 
+	{
+		struct nouveau_bo_priv *cached = nouveau_bo_cache_take(dev, flags, align, size, kind);
+
+		if (cached) {
+			free(nvbo);
+			bo = &cached->base;
+			/* The GPU may still be reading what its last user wrote. */
+			nouveau_bo_fence_wait(bo, 0);
+			atomic_set(&cached->refcnt, 1);
+			cached->access = 0;
+			bo->map = NULL;
+			if (config)
+				bo->config = *config;
+			wine_nx_nouveau_bo_reused++;
+			*pbo = bo;
+			return 0;
+		}
+	}
+
+	start_ns = armTicksToNs(armGetSystemTick());
 	TRACE("Allocating BO of size %ld, align %d, flags 0x%x and kind 0x%x\n", size, align, flags, kind);
 	void* mem = memalign(0x1000, size);
 	if (!mem)
@@ -410,7 +589,10 @@ nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align,
 	bo->flags = flags;
 	nvbo->map_addr = mem;
 	nvbo->fence.id = UINT32_MAX;
-	memset(nvbo->map_addr, 0, bo->size);
+	nvbo->kind = kind;
+	nvbo->align = align;
+	wine_nx_nouveau_bo_new++;
+	wine_nx_nouveau_bo_new_ns += armTicksToNs(armGetSystemTick()) - start_ns;
 
 	if (config)
 		bo->config = *config;

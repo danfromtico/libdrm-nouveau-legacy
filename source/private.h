@@ -55,7 +55,13 @@ struct nouveau_bo_priv {
 	uint32_t access;
 	NvMap map;
 	NvFence fence;
+	int user_memory; /* map_addr belongs to the caller (nouveau_bo_wrap_user) */
+	NvKind kind;     /* what it was allocated for, to match cached bos */
+	uint32_t align;
+	int cacheable;   /* CPU caches it: clean before the GPU reads (Wine-NX) */
 };
+
+void nouveau_bo_cpu_clean(struct nouveau_bo *bo);
 
 static inline struct nouveau_bo_priv *
 nouveau_bo(struct nouveau_bo *bo)

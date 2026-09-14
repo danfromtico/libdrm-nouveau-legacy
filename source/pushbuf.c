@@ -227,6 +227,12 @@ pushbuf_submit(struct nouveau_pushbuf *push, struct nouveau_object *chan)
 			nvpb->bo_builtin_cmdbuf->offset, nvpb->fence_num_cmds,
 			GPFIFO_ENTRY_NOT_MAIN | GPFIFO_ENTRY_NO_PREFETCH, 0);
 
+		/* Wine-NX: the application writes pinned bos through the pointer Wine
+		 * gave it, so nothing tells us when. Clean what this submission reads. */
+		kref = krec->buffer;
+		for (i = 0; i < krec->nr_buffer; i++, kref++)
+			nouveau_bo_cpu_clean(kref->bo);
+
 		// Flush the GPU channel.
 		NvFence fence;
 		TRACE("Submitting %u entries to GPU channel\n", nvpb->gpu_channel.num_entries);

@@ -15,9 +15,10 @@ Mesa 20.1 with the matching Wine-NX changes.
 
 - **Buffer objects are reused.** Each one costs a heap allocation, two
   nvservices calls and a GPU address space mapping, and Mesa creates and frees
-  them for every transfer. Freed objects now go into a small cache (16 entries,
-  16 MiB in all, objects up to 8 MiB) and are handed out again for a matching
-  size, kind and alignment once the fence of their last use has passed. In
+  them for every transfer. Freed objects now go into a cache (64 entries,
+  64 MiB in all, objects up to 8 MiB) and are handed out again for a matching
+  size, kind and alignment once the fence of their last use has passed; when
+  the cache is full, the oldest objects make room. In
   OpenTTD, 5,324 buffer objects came from the cache while 40 were newly
   allocated. A new object's memory is no longer cleared when it is allocated.
 - **Application memory can be pinned.** `nouveau_bo_wrap_user` builds an
